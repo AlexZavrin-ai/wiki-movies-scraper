@@ -14,7 +14,7 @@ class WikiMoviesSpider(scrapy.Spider):
     # Ограничение, чтобы случайно не скачать десятки тысяч фильмов
     max_movies = 200
 
-    #собрать рейтинг IMDb (0/1)
+    # Доп.задание: попытаться собрать рейтинг IMDb (0/1)
     with_imdb = 0
 
     def start_requests(self):
@@ -28,9 +28,38 @@ class WikiMoviesSpider(scrapy.Spider):
         yield scrapy.Request(url, callback=self.parse_category)
 
     def parse_category(self, response):
-        # Ссылки на страницы фильмов (в категории)
-        links = response.css("div.mw-category a::attr(href)").getall()
-        for href in links:
+        """Парсим страницу категории Википедии.
+
+        В Википедии категории часто состоят из:
+        - подкатегорий (например, "Фильмы по годам" -> "Фильмы 2020 года")
+        - страниц (непосредственно страницы фильмов)
+
+        Поэтому мы:
+        1) обходим подкатегории (callback=parse_category)
+        2) обходим страницы фильмов (callback=parse_movie)
+        """
+
+        if self.movie_count >= self.max_movies:
+            return
+
+        # 1) Подкатегории
+        subcat_hrefs = response.css("#mw-subcategories a::attr(href)").getall()
+        for href in subcat_hrefs:
+            if self.movie_count >= self.max_movies:
+                return
+            if not href:
+                continue
+            # В Википедии подкатегории имеют вид /wiki/Категория:...
+            if href.startswith("/wiki/%D0%9A%D0%B0%D1%82%D0%B5%D0%B3%D0%BE%D1%80%D0%B8%D1%8F:") or href.startswith("/wiki/Категория:"):
+                yield scrapy.Request(response.urljoin(href), callback=self.parse_category)
+
+        # 2) Страницы фильмов внутри "Страницы в категории"
+        page_hrefs = response.css("#mw-pages div.mw-category a::attr(href)").getall()
+        if not page_hrefs:
+            # Фолбэк для некоторых страниц
+            page_hrefs = response.css("div.mw-category a::attr(href)").getall()
+
+        for href in page_hrefs:
             if self.movie_count >= self.max_movies:
                 return
             if not href or not href.startswith("/wiki/"):
@@ -39,8 +68,8 @@ class WikiMoviesSpider(scrapy.Spider):
             url = response.urljoin(href)
             yield scrapy.Request(url, callback=self.parse_movie)
 
-        # Следующая страница категории (если есть)
-        next_href = response.css("a:contains('Следующая страница')::attr(href)").get()
+        # 3) Пагинация "Следующая страница" (обычно внутри блока #mw-pages)
+        next_href = response.xpath("//div[@id='mw-pages']//a[contains(., 'Следующая страница')]/@href").get()
         if next_href and self.movie_count < self.max_movies:
             yield scrapy.Request(response.urljoin(next_href), callback=self.parse_category)
 
@@ -49,11 +78,12 @@ class WikiMoviesSpider(scrapy.Spider):
             return
         self.movie_count += 1
 
-        title = response.css("h1#firstHeading::text").get()
-        if title:
-            title = title.strip()
+        # Заголовок статьи (в Википедии текст обычно лежит внутри <span class="mw-page-title-main">)
+        title_parts = response.css("h1#firstHeading ::text").getall()
+        title = " ".join([t.strip() for t in title_parts if t.strip()])
+        title = re.sub(r"\s+", " ", title).strip()
 
-        # доп поля
+        # Поля из инфобокса (карточка справа)
         genre = self._get_infobox_value(response, ["Жанр", "Жанры"])
         director = self._get_infobox_value(response, ["Режиссёр", "Режиссер", "Режиссёры"])
         country = self._get_infobox_value(response, ["Страна", "Страны"])
@@ -68,7 +98,7 @@ class WikiMoviesSpider(scrapy.Spider):
             "imdb_rating": "",
         }
 
-        # IMDb
+        # Доп. задание: IMDb rating
         if self.with_imdb:
             imdb_id = self._extract_imdb_id(response)
             if imdb_id:
@@ -86,7 +116,8 @@ class WikiMoviesSpider(scrapy.Spider):
     def parse_imdb(self, response):
         item = response.meta.get("item", {})
 
-    
+        # Рейтинг часто лежит в JSON-LD:
+        # <script type="application/ld+json"> ... "aggregateRating": {"ratingValue": "..."} ...
         text = response.css("script[type='application/ld+json']::text").get()
         rating = ""
         if text:
@@ -100,7 +131,7 @@ class WikiMoviesSpider(scrapy.Spider):
         item["imdb_rating"] = str(rating).strip()
         yield item
 
- 
+    # ---------------- helpers ----------------
 
     def _get_infobox_value(self, response, keys):
         # Ищем строку инфобокса по заголовку (th) и берём значение из (td)
@@ -133,7 +164,7 @@ class WikiMoviesSpider(scrapy.Spider):
         return ""
 
     def _extract_imdb_id(self, response):
-        # 1) Поиск внешних ссылок на imdb.com
+        # 1) Ищем внешние ссылки на imdb.com/title/tt....
         hrefs = response.css("a.external::attr(href)").getall()
         for h in hrefs:
             if not h:
@@ -142,7 +173,7 @@ class WikiMoviesSpider(scrapy.Spider):
             if m:
                 return m.group(1)
 
-        # 2) на случай если  IMDb ID встречается прямо в html страницы
+        # 2) Иногда IMDb ID встречается прямо в html страницы
         html = response.text
         m = re.search(r"(tt\d{6,10})", html)
         if m:
